@@ -8,10 +8,10 @@ AUTH := docker compose -f auth/deploy/compose.prod.yaml
 SERVER := docker compose -f airlance-server/deploy/compose.yaml
 AUTH_CLI := $(AUTH) exec -T airlance-auth /airlance-auth
 WAIT_TRIES := 45
-SCOPES := --scope profile:read --scope profile:write
+SCOPES := --scope profile:read --scope profile:write --scope messages:read --scope messages:write
 
 .DEFAULT_GOAL := help
-.PHONY: help setup check-tunnel up wait-auth wait-server register down status logs update ios
+.PHONY: help setup check-tunnel up wait-auth wait-server register down status logs update ios seed seed-live seed-clean reset
 
 help: ## Show commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  make %-10s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -27,7 +27,7 @@ setup: ## Clone missing repos and set up defaults once
 		sed -i.bak -e 's|^AIRLANCE_AUTH_SMTP_ADDR=$$|AIRLANCE_AUTH_SMTP_ADDR=mailpit:1025|' \
 			-e 's|^AIRLANCE_AUTH_SMTP_TLS=.*|AIRLANCE_AUTH_SMTP_TLS=none|' "$(AUTH_ENV)" && rm "$(AUTH_ENV).bak"; \
 	fi
-	@if [ -e "$(SERVER_ENV)" ]; then echo "airlance-server: настройки уже есть"; else airlance-server/scripts/init.sh; fi
+	@airlance-server/scripts/init.sh
 	@if ! grep -Eq '^TUNNEL_TOKEN=[^<[:space:]]+' "$(TUNNEL_ENV)"; then \
 		echo "Missing tunnel token in $(TUNNEL_ENV), set it manually" >&2; \
 	fi
@@ -64,7 +64,7 @@ register: ## Register airlance-ios and messenger-api in auth, repeat safely
 		$(AUTH_CLI) oidc client create airlance-ios --name Airlance --native --redirect-uri airlance://auth/callback; \
 	fi
 	@if $(AUTH_CLI) oidc resource list | grep -q '^messenger-api[[:space:]]'; then \
-		echo "messenger-api: уже есть"; \
+		$(AUTH_CLI) oidc resource set-scopes messenger-api $(SCOPES); \
 	else \
 		$(AUTH_CLI) oidc resource register messenger-api --name Messenger --uri https://api.airlance.org \
 			--audience messenger-api $(SCOPES); \
@@ -74,6 +74,18 @@ register: ## Register airlance-ios and messenger-api in auth, repeat safely
 down: ## Stop everything, data is saved
 	$(SERVER) down
 	$(AUTH) down
+
+reset: check-tunnel ## Delete ALL data of both stacks and start from zero: accounts, chats, files, search
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		printf 'This deletes all accounts, passkeys, chats, files and the search index. Type yes to continue: '; \
+		read answer; [ "$$answer" = "yes" ] || { echo "Nothing changed"; exit 1; }; \
+	fi
+	$(SERVER) down -v --remove-orphans
+	$(AUTH) down -v --remove-orphans
+	@$(MAKE) --no-print-directory up
+	@$(MAKE) --no-print-directory register
+	@$(MAKE) --no-print-directory seed
+	@echo "Done. Delete the app from the phone, install it again, sign up, then: make seed TO=@your_username"
 
 status: ## Show containers and public addresses
 	@$(AUTH) ps
@@ -96,6 +108,15 @@ update: ## Get fresh code and rebuild
 	done; \
 	if [ $$failed -ne 0 ]; then echo "Not all repositories updated, I'm not touching the stack" >&2; exit 1; fi
 	@$(MAKE) --no-print-directory up
+
+seed: ## Test people, groups and channels, repeat safely: make seed TO=@your_username
+	$(SERVER) exec -T -e AIRLANCE_SEED=1 airlance-server /airlance-server seed run --to=$(TO)
+
+seed-live: ## Test people write new messages for 10 minutes
+	$(SERVER) exec -T -e AIRLANCE_SEED=1 airlance-server /airlance-server seed live
+
+seed-clean: ## Remove everything seed created
+	$(SERVER) exec -T -e AIRLANCE_SEED=1 airlance-server /airlance-server seed clean
 
 ios: ## Install application on connected phone
 	$(MAKE) -C Airlance device
